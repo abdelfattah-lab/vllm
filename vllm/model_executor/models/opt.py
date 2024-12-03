@@ -22,6 +22,7 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from transformers import OPTConfig
+import torch.nn.functional as F
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig
@@ -44,6 +45,10 @@ from .interfaces import SupportsPP
 from .utils import (is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers)
 
+glob_n = 1024
+glob_n_h = 2048
+#range: 0 ~ 1
+SPARSITY = 0.05
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
 
@@ -102,10 +107,17 @@ class OPTAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        layer_head_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        if layer_head_mask is not None:
+            attn_output = attn_output.view(
+                attn_output.size(0), self.num_heads, self.head_dim
+            )
+            attn_output = attn_output * layer_head_mask.view(-1, 1)
+            attn_output = attn_output.view(attn_output.size(0), self.embed_dim)
         output, _ = self.out_proj(attn_output)
         return output
 
@@ -156,6 +168,8 @@ class OPTDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        layer_fc_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
@@ -164,7 +178,8 @@ class OPTDecoderLayer(nn.Module):
             hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states=hidden_states,
                                        kv_cache=kv_cache,
-                                       attn_metadata=attn_metadata)
+                                       attn_metadata=attn_metadata,
+                                       layer_head_mask=layer_head_mask)
         hidden_states = residual + hidden_states
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
@@ -176,6 +191,8 @@ class OPTDecoderLayer(nn.Module):
         if self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
         hidden_states, _ = self.fc1(hidden_states)
+        if layer_fc_mask is not None:
+            hidden_states = hidden_states * layer_fc_mask
         hidden_states = self.activation_fn(hidden_states)
         hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
@@ -225,7 +242,7 @@ class OPTDecoder(nn.Module):
         else:
             self.project_in = None
 
-        # Note that the only purpose of `config._remove_final_layer_norm` is to
+        # Note that the only purpose of config._remove_final_layer_norm is to
         # keep backward compatibility with checkpoints that have been fine-tuned
         # before transformers v4.20.1
         # see https://github.com/facebookresearch/metaseq/pull/164
@@ -251,7 +268,10 @@ class OPTDecoder(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
+        head_mask: Optional[torch.Tensor] = None,
+        fc_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        return_first_layer_hidden_states: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
@@ -264,19 +284,34 @@ class OPTDecoder(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
+        first_layer_hidden_states = None
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_fc_mask = fc_mask[i] if fc_mask is not None else None
             hidden_states = layer(hidden_states,
                                   kv_caches[i - self.start_layer],
-                                  attn_metadata)
+                                  attn_metadata,
+                                  layer_head_mask=layer_head_mask,
+                                  layer_fc_mask=layer_fc_mask)
+            if i == self.start_layer and return_first_layer_hidden_states:
+                first_layer_hidden_states = hidden_states
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
+            if return_first_layer_hidden_states:
+                return IntermediateTensors({"hidden_states": hidden_states}), first_layer_hidden_states
+            else:
+                return IntermediateTensors({"hidden_states": hidden_states})
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
         if self.project_out is not None:
             hidden_states, _ = self.project_out(hidden_states)
-        return hidden_states
+
+        if return_first_layer_hidden_states:
+            return hidden_states, first_layer_hidden_states
+        else:
+            return hidden_states
 
 
 class OPTModel(nn.Module):
@@ -303,6 +338,8 @@ class OPTModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
+        head_mask: Optional[torch.Tensor] = None,
+        fc_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         return self.decoder(input_ids,
@@ -310,8 +347,71 @@ class OPTModel(nn.Module):
                             kv_caches,
                             attn_metadata,
                             intermediate_tensors,
+                            head_mask=head_mask,
+                            fc_mask=fc_mask,
                             inputs_embeds=inputs_embeds)
 
+    def get_first_layer_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        outputs = self.decoder(input_ids,
+                               positions,
+                               kv_caches,
+                               attn_metadata,
+                               intermediate_tensors,
+                               inputs_embeds=inputs_embeds,
+                               return_first_layer_hidden_states=True)
+                               
+        hidden_states, first_layer_hidden_states = outputs
+        return first_layer_hidden_states
+
+class B1EPredModel(nn.Module):
+    def __init__(self, embedding_dim=2048, output_dim=16):
+        super(B1EPredModel, self).__init__()
+        self.fc1 = nn.Linear(embedding_dim, glob_n_h)
+        self.fc2 = nn.Linear(glob_n_h, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x.squeeze()))
+        x = self.fc2(x)
+        return x
+
+class B1EPredModelFFN(nn.Module):
+    def __init__(self, embedding_dim=2048, output_dim=16):
+        super(B1EPredModelFFN, self).__init__()
+        self.fc1 = nn.Linear(embedding_dim, glob_n)
+        self.fc2 = nn.Linear(glob_n, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+def generate_head_mask(importances, sparsity, num_layers, num_heads):
+    num_heads_total = importances.numel()
+    num_to_keep = max(int((1 - sparsity) * num_heads_total), 1) 
+
+    topk_values = torch.topk(importances, num_to_keep, largest=True).values
+    cutoff = topk_values[-1] 
+
+    mask = (importances >= cutoff).float().view(num_layers, num_heads)
+    return mask.half()
+
+def generate_fc_mask(importances, sparsity, num_layers, ffn_dim):
+    num_neurons_total = importances.numel()
+    num_to_keep = max(int((1 - sparsity) * num_neurons_total), 1)
+
+    topk_values = torch.topk(importances, num_to_keep, largest=True).values
+    cutoff = topk_values[-1] 
+
+    mask = (importances >= cutoff).float().view(num_layers, ffn_dim)
+    return mask.half()
 
 class OPTForCausalLM(nn.Module, SupportsPP):
 
@@ -347,6 +447,18 @@ class OPTForCausalLM(nn.Module, SupportsPP):
         self.sampler = Sampler()
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.head_predictor = B1EPredModel(config.hidden_size, config.num_attention_heads * config.num_hidden_layers)
+        self.head_predictor.load_state_dict(torch.load('b1e.pt'))
+        self.head_predictor.to(device)
+        self.head_predictor.eval()
+
+        self.ffn_predictor = B1EPredModelFFN(config.hidden_size, config.ffn_dim * config.num_hidden_layers)
+        self.ffn_predictor.load_state_dict(torch.load('b1e_fc1.pt'))
+        self.ffn_predictor.to(device)
+        self.ffn_predictor.eval()
 
     def forward(
         self,
@@ -355,9 +467,52 @@ class OPTForCausalLM(nn.Module, SupportsPP):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        # head_mask: Optional[torch.Tensor] = None,
+        # fc_mask: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        # print(f"shape of input_ids: {input_ids.shape}")
+        if intermediate_tensors is not None:
+            hidden_states = intermediate_tensors["hidden_states"]
+        else:
+            inputs_embeds = self.model.get_input_embeddings(input_ids)
+            hidden_states = inputs_embeds
+        
+        first_layer_hidden_states = self.model.get_first_layer_hidden_states(
+            input_ids,
+            positions,
+            kv_caches,
+            attn_metadata,
+            inputs_embeds=inputs_embeds,
+        )
+
+        if first_layer_hidden_states.dim() == 2:
+            pred_input = first_layer_hidden_states[-1, :].unsqueeze(0)
+        else:
+            pred_input = first_layer_hidden_states[:, -1, :]
+
+        pred_input = (pred_input - pred_input.min()) / (pred_input.max() - pred_input.min() + 1e-6)
+
+        head_importance_scores = self.head_predictor(pred_input)
+        # if head_importance_scores.dim() > 1:
+        #     head_importance_scores = head_importance_scores.mean(dim=0)
+        head_importance_scores = head_importance_scores.view(-1)
+        head_mask = generate_head_mask(head_importance_scores, SPARSITY, num_layers=self.config.num_hidden_layers, num_heads=self.config.num_attention_heads)
+        # head_mask = head_mask.view(self.config.num_hidden_layers, self.config.num_attention_heads)
+        head_mask[0, :] = 1.
+        # print(f"Generated head_mask shape: {head_mask.shape}")
+
+        ffn_importance_scores = self.ffn_predictor(pred_input)
+        ffn_importance_scores = ffn_importance_scores.view(-1)
+        # if head_importance_scores.dim() > 1:
+        #     ffn_importance_scores = ffn_importance_scores.mean(dim=0)
+        fc_mask = generate_fc_mask(ffn_importance_scores, SPARSITY, num_layers=self.config.num_hidden_layers, ffn_dim=self.config.ffn_dim)
+        # fc_mask = fc_mask.view(self.config.num_hidden_layers, self.config.ffn_dim)
+        fc_mask[0, :] = 1.
+        # print(f"Generated fc_mask shape: {fc_mask.shape}")
+        
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors)
+                                   attn_metadata, intermediate_tensors,
+                                   head_mask=head_mask, fc_mask=fc_mask)
         return hidden_states
 
     def compute_logits(
