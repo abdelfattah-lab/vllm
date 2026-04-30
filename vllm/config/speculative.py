@@ -71,6 +71,13 @@ class SpeculativeConfig:
 
     enforce_eager: bool | None = None
     """Override the default enforce_eager from model_config"""
+
+    # SMC (Sequential Monte Carlo) speculative decoding parameters.
+    smc_n_particles: int = 1
+    """Number of SMC particles. Values > 1 enable SMC-SD."""
+    smc_temperature: float = 1.0
+    """Draft sampling temperature for SMC particles."""
+
     # General speculative decoding control
     num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the

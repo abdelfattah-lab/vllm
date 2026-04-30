@@ -291,6 +291,47 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def fork_blocks(
+        self,
+        parent_req_id: str,
+        particle_req_ids: list[str],
+        n_decode_blocks: int,
+    ) -> tuple[list[int], list[list[int]]]:
+        """Fork a parent request's KV blocks into N particle entries.
+
+        Touches prefix blocks once per particle (ref_cnt 1 -> 1+N), allocates
+        fresh decode blocks per particle, then frees the parent entry
+        (ref_cnt drops back to N).
+
+        Args:
+            parent_req_id: The request ID of the completed-prefill parent.
+            particle_req_ids: IDs for the N particle entries to register.
+            n_decode_blocks: Fresh decode blocks to allocate per particle.
+
+        Returns:
+            prefix_block_ids: block IDs of the shared prefix (read-only during draft)
+            decode_block_ids: per-particle list of freshly allocated decode block IDs
+        """
+        prefix_blocks = list(self.req_to_blocks.get(parent_req_id, []))
+
+        # Touch prefix blocks once per particle: ref_cnt 1 -> 1+N.
+        for _ in particle_req_ids:
+            self.block_pool.touch(prefix_blocks)
+
+        # Allocate decode blocks and register each particle.
+        decode_block_ids: list[list[int]] = []
+        for p_id in particle_req_ids:
+            dec_blocks = self.block_pool.get_new_blocks(n_decode_blocks)
+            self.req_to_blocks[p_id] = prefix_blocks + dec_blocks
+            decode_block_ids.append([b.block_id for b in dec_blocks])
+            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
+                self.new_block_ids.extend(b.block_id for b in dec_blocks)
+
+        # Free parent: ref_cnt of prefix blocks 1+N -> N; parent entry removed.
+        self.free(parent_req_id)
+
+        return [b.block_id for b in prefix_blocks], decode_block_ids
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

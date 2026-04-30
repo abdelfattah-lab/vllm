@@ -436,6 +436,28 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def fork_blocks(
+        self,
+        parent_req_id: str,
+        particle_req_ids: list[str],
+        n_decode_blocks: int,
+    ) -> tuple[list[int], list[list[int]]]:
+        """Fork parent KV blocks into N particle entries.
+
+        Delegates to each SingleTypeKVCacheManager. Currently assumes a single
+        KV cache group.
+
+        Returns:
+            prefix_block_ids: shared prefix block IDs
+            decode_block_ids: per-particle decode block IDs
+        """
+        managers = self.coordinator.single_type_managers
+        assert len(managers) == 1, (
+            "fork_blocks currently only supports single-group KV cache; "
+            "extend for multi-group (MLA / hybrid) models."
+        )
+        return managers[0].fork_blocks(parent_req_id, particle_req_ids, n_decode_blocks)
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
