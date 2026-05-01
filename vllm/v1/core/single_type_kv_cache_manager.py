@@ -321,9 +321,9 @@ class SingleTypeKVCacheManager(ABC):
     ) -> tuple[list[int], list[list[int]]]:
         """Fork a parent request's KV blocks into N particle entries.
 
-        Touches prefix blocks once per particle (ref_cnt 1 -> 1+N), allocates
-        fresh decode blocks per particle, then frees the parent entry
-        (ref_cnt drops back to N).
+        Increase ref cnt on prefix blocks once per particle
+        Allocate fresh decode blocks per particle
+        Free the parent request blocks
 
         Args:
             parent_req_id: The request ID of the completed-prefill parent.
@@ -331,7 +331,7 @@ class SingleTypeKVCacheManager(ABC):
             n_decode_blocks: Fresh decode blocks to allocate per particle.
 
         Returns:
-            prefix_block_ids: block IDs of the shared prefix (read-only during draft)
+            prefix_block_ids: block IDs of the shared prefix 
             decode_block_ids: per-particle list of freshly allocated decode block IDs
         """
         prefix_blocks = list(self.req_to_blocks.get(parent_req_id, []))

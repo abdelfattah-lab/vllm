@@ -450,9 +450,7 @@ class KVCacheManager:
         n_decode_blocks: int,
     ) -> tuple[list[int], list[list[int]]]:
         """Fork parent KV blocks into N particle entries.
-
-        Delegates to each SingleTypeKVCacheManager. Currently assumes a single
-        KV cache group.
+        Currently assumes a single KV cache group.
 
         Returns:
             prefix_block_ids: shared prefix block IDs
