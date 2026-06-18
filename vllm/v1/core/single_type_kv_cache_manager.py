@@ -354,6 +354,35 @@ class SingleTypeKVCacheManager(ABC):
 
         return [b.block_id for b in prefix_blocks], decode_block_ids
 
+    def remap_blocks(self, request_id: str, new_block_ids: list[int]) -> None:
+        """Replace a request's block list with an already-allocated mapping.
+
+        This is used by SMC resampling: full blocks may become shared with an
+        ancestor particle, while the destination keeps its private tail/future
+        blocks. No new blocks are allocated here; refcounts are adjusted to
+        match the new ownership.
+        """
+        old_blocks = list(self.req_to_blocks.get(request_id, []))
+        new_blocks = [self.block_pool.blocks[bid] for bid in new_block_ids]
+
+        old_ids = {block.block_id for block in old_blocks}
+        new_ids = {block.block_id for block in new_blocks}
+
+        blocks_to_touch = [
+            block for block in new_blocks if block.block_id not in old_ids
+        ]
+        if blocks_to_touch:
+            self.block_pool.touch(blocks_to_touch)
+
+        blocks_to_free = [
+            block for block in old_blocks if block.block_id not in new_ids
+        ]
+        if blocks_to_free:
+            self.block_pool.free_blocks(reversed(blocks_to_free))
+
+        self.req_to_blocks[request_id] = new_blocks
+        self.num_cached_block.pop(request_id, None)
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

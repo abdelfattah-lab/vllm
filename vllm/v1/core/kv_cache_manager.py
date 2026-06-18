@@ -463,6 +463,18 @@ class KVCacheManager:
         )
         return managers[0].fork_blocks(parent_req_id, particle_req_ids, n_decode_blocks)
 
+    def remap_blocks(self, request_id: str, new_block_ids: list[int]) -> None:
+        """Replace a particle request block list with existing block IDs.
+
+        Currently assumes a single KV cache group, matching fork_blocks.
+        """
+        managers = self.coordinator.single_type_managers
+        assert len(managers) == 1, (
+            "remap_blocks currently only supports single-group KV cache; "
+            "extend for multi-group (MLA or hybrid) models."
+        )
+        managers[0].remap_blocks(request_id, new_block_ids)
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
