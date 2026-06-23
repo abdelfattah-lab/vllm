@@ -443,6 +443,63 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def fork_blocks(
+        self,
+        parent_req_id: str,
+        particle_req_ids: list[str],
+        n_decode_blocks: int,
+    ) -> tuple[list[int], list[list[int]]]:
+        """Fork parent KV blocks into N particle entries.
+        Currently assumes a single KV cache group.
+
+        Returns:
+            prefix_block_ids: shared prefix block IDs
+            decode_block_ids: per-particle decode block IDs
+        """
+        managers = self.coordinator.single_type_managers
+        assert len(managers) == 1, (
+            "fork_blocks currently only supports single-group KV cache; "
+            "extend for multi-group (MLA / hybrid) models."
+        )
+        return managers[0].fork_blocks(parent_req_id, particle_req_ids, n_decode_blocks)
+
+    def remap_blocks(self, request_id: str, new_block_ids: list[int]) -> None:
+        """Replace a particle request block list with existing block IDs.
+
+        Currently assumes a single KV cache group, matching fork_blocks.
+        """
+        managers = self.coordinator.single_type_managers
+        assert len(managers) == 1, (
+            "remap_blocks currently only supports single-group KV cache; "
+            "extend for multi-group (MLA or hybrid) models."
+        )
+        managers[0].remap_blocks(request_id, new_block_ids)
+
+    def smc_make_write_blocks_private(
+        self,
+        request_id: str,
+        logical_block_indices: list[int],
+        copy_required_indices: set[int],
+    ) -> tuple[list[int], list[tuple[int, int, int, bool]], list[int]]:
+        """Ensure selected SMC particle blocks are private for writes."""
+        managers = self.coordinator.single_type_managers
+        assert len(managers) == 1, (
+            "smc_make_write_blocks_private currently only supports single-group "
+            "KV cache; extend for multi-group (MLA or hybrid) models."
+        )
+        return managers[0].smc_make_write_blocks_private(
+            request_id, logical_block_indices, copy_required_indices
+        )
+
+    def smc_release_pinned_blocks(self, block_ids: list[int]) -> None:
+        """Release temporary SMC COW pins after worker-side KV copies."""
+        managers = self.coordinator.single_type_managers
+        assert len(managers) == 1, (
+            "smc_release_pinned_blocks currently only supports single-group "
+            "KV cache; extend for multi-group (MLA or hybrid) models."
+        )
+        managers[0].smc_release_pinned_blocks(block_ids)
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:

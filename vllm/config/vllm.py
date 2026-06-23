@@ -295,6 +295,8 @@ class VllmConfig:
     """LoRA configuration."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
+    smc_config: Any | None = None
+    """SMC (Sequential Monte Carlo) speculative decoding configuration."""
     structured_outputs_config: StructuredOutputsConfig = Field(
         default_factory=StructuredOutputsConfig
     )
