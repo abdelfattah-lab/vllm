@@ -383,6 +383,66 @@ class SingleTypeKVCacheManager(ABC):
         self.req_to_blocks[request_id] = new_blocks
         self.num_cached_block.pop(request_id, None)
 
+    def smc_make_write_blocks_private(
+        self,
+        request_id: str,
+        logical_block_indices: list[int],
+        copy_required_indices: set[int],
+    ) -> tuple[list[int], list[tuple[int, int, int, bool]], list[int]]:
+        """Ensure selected logical blocks are private for SMC writes.
+
+        Returns:
+            - the request full block-id row after repair
+            - copy repairs as (logical_idx, old_block_id, new_block_id,
+              copy_required)
+            - old block IDs pinned as copy sources until the worker copies KV
+        """
+        req_blocks = self.req_to_blocks[request_id]
+        repairs: list[tuple[int, int, int, bool]] = []
+        pinned_block_ids: list[int] = []
+
+        max_idx = max(logical_block_indices, default=-1)
+        if max_idx >= len(req_blocks):
+            new_blocks = self.block_pool.get_new_blocks(max_idx + 1 - len(req_blocks))
+            req_blocks.extend(new_blocks)
+            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
+                self.new_block_ids.extend(b.block_id for b in new_blocks)
+
+        for logical_idx in logical_block_indices:
+            old_block = req_blocks[logical_idx]
+            copy_required = logical_idx in copy_required_indices
+            if old_block.ref_cnt <= 1 and not old_block.is_null:
+                continue
+
+            new_block = self.block_pool.get_new_blocks(1)[0]
+            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
+                self.new_block_ids.append(new_block.block_id)
+
+            if copy_required:
+                self.block_pool.touch([old_block])
+                pinned_block_ids.append(old_block.block_id)
+
+            req_blocks[logical_idx] = new_block
+            if not old_block.is_null:
+                self.block_pool.free_blocks([old_block])
+
+            repairs.append(
+                (
+                    logical_idx,
+                    old_block.block_id,
+                    new_block.block_id,
+                    copy_required,
+                )
+            )
+
+        self.num_cached_block.pop(request_id, None)
+        return [b.block_id for b in req_blocks], repairs, pinned_block_ids
+
+    def smc_release_pinned_blocks(self, block_ids: list[int]) -> None:
+        """Release temporary SMC COW pins created for deferred KV copies."""
+        for block_id in block_ids:
+            self.block_pool.free_blocks([self.block_pool.blocks[block_id]])
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
